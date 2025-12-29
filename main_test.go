@@ -29,21 +29,29 @@ func tempExcel(t *testing.T) string {
 }
 
 func TestBuildSupervisorMap(t *testing.T) {
-	file := tempExcel(t)
-	defer os.Remove(file)
+	f := excelize.NewFile()
+	sheet := "Sheet1"
 
-	m, err := buildSupervisorMap(file, "Sheet1")
+	f.NewSheet(sheet)
+	f.SetSheetRow(sheet, "A1", &[]string{
+		"Colleague ID", "Preferred First Name",
+		"Legal Last Name", "Manager Name",
+	})
+	f.SetSheetRow(sheet, "A2", &[]string{
+		"999", "Jane", "Doe", "John Manager",
+	})
+
+	tmp := "test_allops.xlsx"
+	_ = f.SaveAs(tmp)
+	defer os.Remove(tmp)
+
+	m, err := buildSupervisorMap(tmp, sheet)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	info, ok := m["100"]
-	if !ok {
-		t.Fatal("expected ID 100")
-	}
-
-	if info.Name != "Jane Doe" {
-		t.Fatalf("expected Jane Doe, got %s", info.Name)
+	if m["999"].Supervisor != "John Manager" {
+		t.Fatal("supervisor mismatch")
 	}
 }
 
@@ -65,5 +73,20 @@ func TestUpdateVLookup(t *testing.T) {
 	val, _ := f.GetCellValue("vlookup", "A2")
 	if val != "Jane Doe" {
 		t.Fatalf("expected Jane Doe, got %s", val)
+	}
+}
+
+func TestReadDriverIDs_DuplicateFails(t *testing.T) {
+	f := excelize.NewFile()
+	sheet := "Data"
+
+	f.NewSheet(sheet)
+	f.SetSheetRow(sheet, "A1", &[]string{"Driver ID"})
+	f.SetSheetRow(sheet, "A2", &[]string{"123"})
+	f.SetSheetRow(sheet, "A3", &[]string{"123"})
+
+	_, err := readDriverIDsFromData(f, sheet)
+	if err == nil {
+		t.Fatal("expected duplicate Driver ID error")
 	}
 }

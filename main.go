@@ -10,37 +10,75 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
+/* ===================== Types ===================== */
+
 type SupervisorInfo struct {
 	Name       string
 	Supervisor string
 }
 
+type ValidationReport struct {
+	MissingInAllops []string
+}
+
+/* ===================== Main ===================== */
+
 func main() {
 	masterFile := flag.String("master", "", "ALLOPS master Excel file")
 	targetFile := flag.String("target", "", "Shorts report Excel file")
-	masterSheet := flag.String("master-sheet", "Sheet1", "Master sheet name")
-	vlookupSheet := flag.String("vlookup-sheet", "vlookup", "VLOOKUP sheet")
+
+	masterSheet := flag.String("master-sheet", "Sheet1", "ALLOPS sheet")
+	dataSheet := flag.String("data-sheet", "Data", "Shorts Data sheet")
+	vlookupSheet := flag.String("vlookup-sheet", "vlookup", "Shorts vlookup sheet")
+
 	outFile := flag.String("out", "output.xlsx", "Output file")
-	dryRun := flag.Bool("dry-run", false, "Dry run (no writes)")
+	dryRun := flag.Bool("dry-run", false, "Dry run")
 	flag.Parse()
 
 	if *masterFile == "" || *targetFile == "" {
 		log.Fatal("master and target files are required")
 	}
 
-	lookup, err := buildSupervisorMap(*masterFile, *masterSheet)
+	allops, err := buildSupervisorMap(*masterFile, *masterSheet)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	f, err := excelize.OpenFile(*targetFile)
+	shorts, err := excelize.OpenFile(*targetFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+	defer shorts.Close()
 
-	if err := updateVLookupSheet(f, *vlookupSheet, lookup, *dryRun); err != nil {
+	driverIDs, err := readDriverIDsFromData(shorts, *dataSheet)
+	if err != nil {
 		log.Fatal(err)
+	}
+
+	if err := cleanupVLookupDuplicates(
+		shorts,
+		*vlookupSheet,
+		*dryRun,
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	report, err := updateVLookup(
+		shorts,
+		*vlookupSheet,
+		driverIDs,
+		allops,
+		*dryRun,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if len(report.MissingInAllops) > 0 {
+		fmt.Println("WARNING: Drivers missing in ALLOPS:")
+		for _, id := range report.MissingInAllops {
+			fmt.Printf("  - %s\n", id)
+		}
 	}
 
 	if *dryRun {
@@ -48,14 +86,14 @@ func main() {
 		return
 	}
 
-	if err := f.SaveAs(*outFile); err != nil {
+	if err := shorts.SaveAs(*outFile); err != nil {
 		log.Fatal(err)
 	}
 
 	fmt.Println("Update completed successfully.")
 }
 
-/* ---------------- Header Matching ---------------- */
+/* ===================== Header Matching ===================== */
 
 var nonAlphaNum = regexp.MustCompile(`[^a-z0-9]+`)
 
@@ -69,24 +107,6 @@ func fuzzyMatch(have, want string) bool {
 	h := normalizeHeader(have)
 	w := normalizeHeader(want)
 	return h == w || strings.Contains(h, w) || strings.Contains(w, h)
-}
-
-func findHeaderRow(rows [][]string, required []string) (int, []int) {
-	for i, row := range rows {
-		matches := 0
-		for _, cell := range row {
-			for _, r := range required {
-				if fuzzyMatch(cell, r) {
-					matches++
-				}
-			}
-		}
-		if matches >= len(required)-1 {
-			return i, findColumns(row, required...)
-		}
-	}
-	log.Fatalf("Could not locate header row with required columns: %v", required)
-	return -1, nil
 }
 
 func findColumns(headers []string, wanted ...string) []int {
@@ -111,10 +131,10 @@ func findColumns(headers []string, wanted ...string) []int {
 	return indexes
 }
 
-/* ---------------- Master Parsing ---------------- */
+/* ===================== ALLOPS Parsing ===================== */
 
-func buildSupervisorMap(filename, sheet string) (map[string]SupervisorInfo, error) {
-	f, err := excelize.OpenFile(filename)
+func buildSupervisorMap(file, sheet string) (map[string]SupervisorInfo, error) {
+	f, err := excelize.OpenFile(file)
 	if err != nil {
 		return nil, err
 	}
@@ -125,42 +145,77 @@ func buildSupervisorMap(filename, sheet string) (map[string]SupervisorInfo, erro
 		return nil, err
 	}
 
-	headerRow, cols := findHeaderRow(
-		rows,
-		[]string{
-			"Colleague ID",
-			"Preferred First Name",
-			"Legal Last Name",
-			"Manager Name",
-		},
+	cols := findColumns(
+		rows[0],
+		"Colleague ID",
+		"Preferred First Name",
+		"Legal Last Name",
+		"Manager Name",
 	)
 
-	result := make(map[string]SupervisorInfo)
-	for i := headerRow + 1; i < len(rows); i++ {
-		row := rows[i]
-		id := value(row, cols[0])
+	result := map[string]SupervisorInfo{}
+
+	for i := 1; i < len(rows); i++ {
+		id := value(rows[i], cols[0])
 		if id == "" {
 			continue
 		}
 
-		name := strings.TrimSpace(
-			value(row, cols[1]) + " " + value(row, cols[2]),
-		)
-
 		result[id] = SupervisorInfo{
-			Name:       name,
-			Supervisor: value(row, cols[3]),
+			Name: strings.TrimSpace(
+				value(rows[i], cols[1]) + " " + value(rows[i], cols[2]),
+			),
+			Supervisor: value(rows[i], cols[3]),
 		}
 	}
+
 	return result, nil
 }
 
-/* ---------------- VLOOKUP Update ---------------- */
+/* ===================== Data Sheet Parsing ===================== */
 
-func updateVLookupSheet(
+func readDriverIDsFromData(
 	f *excelize.File,
 	sheet string,
-	lookup map[string]SupervisorInfo,
+) ([]string, error) {
+
+	rows, err := f.GetRows(sheet)
+	if err != nil {
+		return nil, err
+	}
+
+	cols := findColumns(rows[0], "Driver ID")
+
+	seen := map[string]bool{}
+	var ids []string
+
+	for i := 1; i < len(rows); i++ {
+		id := value(rows[i], cols[0])
+		if id == "" {
+			continue
+		}
+
+		// IGNORE duplicates, do not fail
+		if seen[id] {
+			log.Printf(
+				"duplicate Driver ID ignored in Data sheet: %s (row %d)",
+				id,
+				i+1,
+			)
+			continue
+		}
+
+		seen[id] = true
+		ids = append(ids, id)
+	}
+
+	return ids, nil
+}
+
+/* ===================== vlookup Update ===================== */
+func cleanupVLookupDuplicates(
+	f *excelize.File,
+	sheet string,
 	dryRun bool,
 ) error {
 
@@ -173,23 +228,109 @@ func updateVLookupSheet(
 		rows[0],
 		"Driver Name",
 		"Driver Number",
+	)
+
+	type seenEntry struct {
+		name string
+		row  int
+	}
+
+	seen := map[string]seenEntry{}
+	var rowsToDelete []int
+
+	for i := 1; i < len(rows); i++ {
+		rowNum := i + 1
+		id := value(rows[i], cols[1])
+		name := value(rows[i], cols[0])
+
+		if id == "" {
+			continue
+		}
+
+		if prev, exists := seen[id]; exists {
+			// Same ID + same name → safe duplicate
+			if prev.name == name {
+				rowsToDelete = append(rowsToDelete, rowNum)
+				continue
+			}
+
+			// Same ID + different name → corruption
+			return fmt.Errorf(
+				"conflicting Driver Name for Driver ID %s: '%s' vs '%s'",
+				id,
+				prev.name,
+				name,
+			)
+		}
+
+		seen[id] = seenEntry{name: name, row: rowNum}
+	}
+
+	// Delete bottom-up to preserve row indexes
+	for i := len(rowsToDelete) - 1; i >= 0; i-- {
+		if !dryRun {
+			f.RemoveRow(sheet, rowsToDelete[i])
+		}
+	}
+
+	if len(rowsToDelete) > 0 {
+		log.Printf(
+			"vlookup cleanup: removed %d duplicate rows",
+			len(rowsToDelete),
+		)
+	}
+
+	return nil
+}
+
+func updateVLookup(
+	f *excelize.File,
+	sheet string,
+	driverIDs []string,
+	allops map[string]SupervisorInfo,
+	dryRun bool,
+) (*ValidationReport, error) {
+
+	rows, err := f.GetRows(sheet)
+	if err != nil {
+		return nil, err
+	}
+
+	cols := findColumns(
+		rows[0],
+		"Driver Name",
+		"Driver Number",
 		"Supervisor",
 	)
 
 	existing := map[string]int{}
 	for i := 1; i < len(rows); i++ {
 		id := value(rows[i], cols[1])
-		if id != "" {
-			existing[id] = i + 1
+		if id == "" {
+			continue
 		}
+		if _, dup := existing[id]; dup {
+			return nil, fmt.Errorf(
+				"duplicate Driver ID found in vlookup sheet: %s",
+				id,
+			)
+		}
+		existing[id] = i + 1
 	}
 
 	nextRow := len(rows) + 1
+	report := &ValidationReport{}
 
-	for id, info := range lookup {
-		if rowNum, ok := existing[id]; ok {
+	for _, id := range driverIDs {
+		info, ok := allops[id]
+		if !ok {
+			report.MissingInAllops = append(report.MissingInAllops, id)
+			continue
+		}
+
+		if row, exists := existing[id]; exists {
 			if !dryRun {
-				f.SetCellValue(sheet, cell(cols[2], rowNum), info.Supervisor)
+				f.SetCellValue(sheet, cell(cols[2], row), info.Supervisor)
 			}
 		} else {
 			if !dryRun {
@@ -200,10 +341,11 @@ func updateVLookupSheet(
 			nextRow++
 		}
 	}
-	return nil
+
+	return report, nil
 }
 
-/* ---------------- Helpers ---------------- */
+/* ===================== Helpers ===================== */
 
 func value(row []string, idx int) string {
 	if idx >= len(row) {
